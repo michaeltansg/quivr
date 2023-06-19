@@ -1,3 +1,7 @@
+import asyncio
+from typing import AsyncIterable, Awaitable
+
+from langchain.callbacks import AsyncIteratorCallbackHandler
 from langchain.embeddings.openai import OpenAIEmbeddings
 from langchain.schema import Document
 from llm.qa import get_qa_llm
@@ -22,11 +26,13 @@ def create_summary(commons: CommonsDep, document_id, content, metadata):
         commons['supabase'].table("summaries").update(
             {"document_id": document_id}).match({"id": sids[0]}).execute()
 
-def create_vector(commons: CommonsDep, user_id,doc, user_openai_api_key=None):
+
+def create_vector(commons: CommonsDep, user_id, doc, user_openai_api_key=None):
     logger.info(f"Creating vector for document")
     logger.info(f"Document: {doc}")
     if user_openai_api_key:
-        commons['documents_vector_store']._embedding = OpenAIEmbeddings(openai_api_key=user_openai_api_key)
+        commons['documents_vector_store']._embedding = OpenAIEmbeddings(
+            openai_api_key=user_openai_api_key)
     try:
         sids = commons['documents_vector_store'].add_documents(
             [doc])
@@ -37,8 +43,10 @@ def create_vector(commons: CommonsDep, user_id,doc, user_openai_api_key=None):
     except Exception as e:
         logger.error(f"Error creating vector for document {e}")
 
+
 def create_embedding(commons: CommonsDep, content):
     return commons['embeddings'].embed_query(content)
+
 
 def similarity_search(commons: CommonsDep, query, table='match_summaries', top_k=5, threshold=0.5):
     query_embedding = create_embedding(commons, query)
@@ -47,14 +55,15 @@ def similarity_search(commons: CommonsDep, query, table='match_summaries', top_k
                 'match_count': top_k, 'match_threshold': threshold}
     ).execute()
     return summaries.data
-   
-def get_answer(commons: CommonsDep,  chat_message: ChatMessage, email: str, user_openai_api_key:str):
+
+
+def get_answer(commons: CommonsDep,  chat_message: ChatMessage, email: str, user_openai_api_key: str):
     qa = get_qa_llm(chat_message, email, user_openai_api_key)
 
     if chat_message.use_summarization:
         # 1. get summaries from the vector store based on question
-        summaries = similarity_search(commons, 
-            chat_message.question, table='match_summaries')
+        summaries = similarity_search(commons,
+                                      chat_message.question, table='match_summaries')
         # 2. evaluate summaries against the question
         evaluations = llm_evaluate_summaries(
             chat_message.question, summaries, chat_message.model)
@@ -76,7 +85,8 @@ def get_answer(commons: CommonsDep,  chat_message: ChatMessage, email: str, user
             user_message = chat_message.history[i][1]
             assistant_message = chat_message.history[i + 1][1]
             transformed_history.append((user_message, assistant_message))
-        model_response = qa({"question": chat_message.question, "chat_history":transformed_history})
+        model_response = qa(
+            {"question": chat_message.question, "chat_history": transformed_history})
 
     answer = model_response['answer']
 
@@ -94,3 +104,43 @@ def get_answer(commons: CommonsDep,  chat_message: ChatMessage, email: str, user
             answer = answer + "\n\nRef: " + "; ".join(files)
 
     return answer
+
+
+async def get_streaming_answer(commons: CommonsDep, chat_message: ChatMessage, email: str, user_openai_api_key: str) -> AsyncIterable[str]:
+    callback = AsyncIteratorCallbackHandler()
+    qa = get_qa_llm(chat_message, email, user_openai_api_key,
+                    streaming=True, callback=callback)
+
+    async def wrap_done(fn: Awaitable, event: asyncio.Event):
+        try:
+            await fn
+        except Exception as e:
+            print(f"Caught exception: {type(e).__name__}, {e}")
+        finally:
+            event.set()
+
+    if chat_message.use_summarization:
+        summaries = similarity_search(
+            commons, chat_message.question, table='match_summaries')
+        evaluations = llm_evaluate_summaries(
+            chat_message.question, summaries, chat_message.model)
+        if evaluations:
+            response = commons['supabase'].from_('vectors').select(
+                '*').in_('id', values=[e['document_id'] for e in evaluations]).execute()
+            additional_context = '---\nAdditional Context={}'.format(
+                '---\n'.join(data['content'] for data in response.data)) + '\n'
+            task = asyncio.create_task(wrap_done(
+                qa({"question": additional_context + chat_message.question}), callback.done))
+        else:
+            task = asyncio.create_task(
+                wrap_done(qa({"question": chat_message.question}), callback.done))
+    else:
+        transformed_history = [(chat_message.history[i][1], chat_message.history[i + 1][1])
+                               for i in range(0, len(chat_message.history) - 1, 2)]
+        task = asyncio.create_task(wrap_done(
+            qa({"question": chat_message.question, "chat_history": transformed_history}), callback.done))
+
+    async for token in callback.aiter():
+        yield f"data: {token}\n\n"
+
+    await task
