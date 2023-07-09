@@ -8,6 +8,8 @@ services:
       context: frontend
       dockerfile: Dockerfile
     container_name: web
+    networks:
+      - common
     restart: always
     ports:
       - 3000:3000
@@ -18,9 +20,14 @@ services:
       context: backend
       dockerfile: Dockerfile
     container_name: backend
+    networks:
+      - common
     restart: always
     volumes:
       - ./backend/:/code/
       - ~/.config/gcloud:/root/.config/gcloud
     ports:
       - 5050:5050
+networks:
+  common:
+    driver: bridge
